@@ -1,0 +1,19 @@
+[package]
+name = "gearbox"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A minimal, serial Agent Loop using the Responses API"
+
+[dependencies]
+anyhow = "1"
+argh = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+same-file = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+toml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"

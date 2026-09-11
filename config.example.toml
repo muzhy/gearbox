@@ -1,0 +1,12 @@
+[model]
+endpoint = "https://fireware.ai.ugreencloud.com/v1/responses"
+api_key = ""
+name = "gpt-6-astra"
+reasoning_effort = "low"
+
+[limits]
+max_model_requests = 8
+request_timeout_secs = 60
+max_output_tokens = 8192
+max_file_bytes = 16384
+
