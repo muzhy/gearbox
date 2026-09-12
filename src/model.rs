@@ -7,7 +7,7 @@ use reqwest::{
 };
 use serde_json::{Value, json};
 
-use crate::{Limits, ModelConfig, ReasoningEffort};
+use crate::config::file::{Limits, ModelConfig, ReasoningEffort};
 
 pub struct ModelClient {
     client: Client,

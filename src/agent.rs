@@ -17,7 +17,11 @@ pub async fn run(
     ];
 
     for request in 1..=max_requests {
-        eprintln!("Model request {request}/{max_requests}");
+        tracing::info!(
+            request,
+            max_requests,
+            "Model request {request}/{max_requests}"
+        );
         // respond validates the whole batch before any file tool can execute.
         let turn = client.respond(&history, tool.definition()).await?;
         if turn.calls.is_empty() {

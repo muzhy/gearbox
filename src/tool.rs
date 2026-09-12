@@ -55,7 +55,7 @@ impl FileTool {
         let result = if name == "read_file" {
             self.read_file(arguments)
         } else {
-            eprintln!("tool: {} (unknown tool)", name.escape_debug());
+            tracing::warn!(tool = %name.escape_debug(), "unknown tool");
             Err("unknown tool; only read_file is supported")
         };
         match result {
@@ -72,7 +72,7 @@ impl FileTool {
         }
         let arguments: ReadFileArguments = serde_json::from_str(arguments)
             .map_err(|_| "read_file requires an object containing only a string path")?;
-        eprintln!("tool: read_file path=\"{}\"", arguments.path.escape_debug());
+        tracing::info!("tool: read_file path=\"{}\"", arguments.path.escape_debug());
         if arguments.path.trim().is_empty() {
             return Err("path must not be empty or whitespace");
         }
