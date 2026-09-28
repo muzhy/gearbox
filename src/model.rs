@@ -5,15 +5,19 @@ use reqwest::{
     Client, Url,
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::config::file::{Limits, ModelConfig, ReasoningEffort};
+use crate::config::file::{
+    DeprecatedModelPolicy, DiscoveryErrorPolicy, Limits, MissingModelPolicy, ModelConfig,
+    ModelDiscoveryConfig, ProviderConfig,
+};
 
 pub struct ModelClient {
     client: Client,
     endpoint: Url,
     model: String,
-    reasoning_effort: ReasoningEffort,
+    reasoning: bool,
     max_output_tokens: u32,
 }
 
@@ -29,41 +33,46 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+#[derive(Deserialize)]
+struct ModelList {
+    data: Vec<CatalogModel>,
+}
+
+#[derive(Deserialize)]
+struct CatalogModel {
+    id: String,
+    #[serde(default)]
+    deprecated: bool,
+    status: Option<String>,
+}
+
 impl ModelClient {
-    pub fn new(config: &ModelConfig, limits: &Limits) -> Result<Self> {
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {}", config.api_key))
-            .expect("configuration validates the authentication header");
-        authorization.set_sensitive(true);
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, authorization);
-        let client = Client::builder()
-            .default_headers(headers)
-            .timeout(Duration::from_secs(limits.request_timeout_secs))
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .build()
-            .map_err(|_| anyhow::anyhow!("无法初始化模型 HTTP 客户端"))?;
+    pub fn new(config: &ModelConfig, provider: &ProviderConfig, limits: &Limits) -> Result<Self> {
         Ok(Self {
-            client,
-            endpoint: config.endpoint.clone(),
-            model: config.name.clone(),
-            reasoning_effort: config.reasoning_effort,
+            client: provider_client(provider, limits)?,
+            endpoint: provider.responses_endpoint(),
+            model: config.id.clone(),
+            reasoning: config.reasoning,
             max_output_tokens: limits.max_output_tokens,
         })
     }
 
     pub async fn respond(&self, history: &[Value], tool_definition: Value) -> Result<ModelTurn> {
-        let request = json!({
+        let mut request = json!({
             "model": self.model,
             "input": history,
             "tools": [tool_definition],
             "stream": false,
             "store": false,
-            "include": ["reasoning.encrypted_content"],
-            "reasoning": { "effort": self.reasoning_effort },
             "max_output_tokens": self.max_output_tokens,
             "truncation": "disabled",
         });
+        if self.reasoning {
+            request["include"] = json!(["reasoning.encrypted_content"]);
+            // Let the service choose its default reasoning effort. The model
+            // capability is configuration; an effort value is not a model ID.
+            request["reasoning"] = json!({});
+        }
         let response = self
             .client
             .post(self.endpoint.clone())
@@ -83,12 +92,146 @@ impl ModelClient {
     }
 }
 
+pub(crate) async fn validate_configured_model(
+    config: &ModelConfig,
+    provider: &ProviderConfig,
+    limits: &Limits,
+) -> Result<()> {
+    let Some(discovery) = &provider.discovery else {
+        return Ok(());
+    };
+    let catalog = fetch_model_catalog(provider, &discovery.path, limits).await;
+    match catalog {
+        Ok(catalog) => reconcile_model_catalog(&config.id, discovery, &catalog),
+        Err(error) => match discovery.on_error {
+            DiscoveryErrorPolicy::UseConfig => {
+                tracing::warn!(
+                    provider = %config.provider,
+                    model = %config.id,
+                    error = %error,
+                    "model discovery failed; using the configured model"
+                );
+                Ok(())
+            }
+            DiscoveryErrorPolicy::Error => Err(error),
+        },
+    }
+}
+
+fn provider_client(provider: &ProviderConfig, limits: &Limits) -> Result<Client> {
+    let mut authorization = HeaderValue::from_str(&format!("Bearer {}", provider.api_key))
+        .expect("configuration validates the authentication header");
+    authorization.set_sensitive(true);
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, authorization);
+    Client::builder()
+        .default_headers(headers)
+        .timeout(Duration::from_secs(limits.request_timeout_secs))
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .build()
+        .map_err(|_| anyhow::anyhow!("无法初始化模型 HTTP 客户端"))
+}
+
+async fn fetch_model_catalog(
+    provider: &ProviderConfig,
+    path: &str,
+    limits: &Limits,
+) -> Result<Vec<CatalogModel>> {
+    let response = provider_client(provider, limits)?
+        .get(provider.endpoint(path))
+        .send()
+        .await
+        .map_err(catalog_transport_error)?;
+    ensure!(
+        response.status().is_success(),
+        "模型目录服务返回 HTTP {}",
+        response.status().as_u16()
+    );
+    let bytes = response.bytes().await.map_err(catalog_transport_error)?;
+    let catalog: ModelList =
+        serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("模型目录响应格式无效"))?;
+    ensure!(
+        catalog.models_have_valid_ids(),
+        "模型目录包含无效的模型标识"
+    );
+    Ok(catalog.data)
+}
+
+pub(crate) async fn fetch_provider_models(
+    provider: &ProviderConfig,
+    path: &str,
+    limits: &Limits,
+) -> Result<Vec<String>> {
+    Ok(fetch_model_catalog(provider, path, limits)
+        .await?
+        .into_iter()
+        .map(|model| model.id)
+        .collect())
+}
+
+impl ModelList {
+    fn models_have_valid_ids(&self) -> bool {
+        self.data.iter().all(|model| !model.id.trim().is_empty())
+    }
+}
+
+fn reconcile_model_catalog(
+    configured_id: &str,
+    discovery: &ModelDiscoveryConfig,
+    catalog: &[CatalogModel],
+) -> Result<()> {
+    let Some(model) = catalog.iter().find(|model| model.id == configured_id) else {
+        return match discovery.on_missing {
+            MissingModelPolicy::Allow => Ok(()),
+            MissingModelPolicy::Warn => {
+                tracing::warn!(
+                    model = configured_id,
+                    "configured model is absent from the provider catalog; using it unchanged"
+                );
+                Ok(())
+            }
+            MissingModelPolicy::Error => {
+                bail!("configured model is absent from the provider catalog")
+            }
+        };
+    };
+
+    let deprecated = model.deprecated
+        || model
+            .status
+            .as_deref()
+            .is_some_and(|status| status.eq_ignore_ascii_case("deprecated"));
+    if !deprecated {
+        return Ok(());
+    }
+    match discovery.on_deprecated {
+        DeprecatedModelPolicy::Ignore => Ok(()),
+        DeprecatedModelPolicy::Warn => {
+            tracing::warn!(
+                model = configured_id,
+                "configured model is deprecated; using it unchanged"
+            );
+            Ok(())
+        }
+        DeprecatedModelPolicy::Error => bail!("configured model is deprecated"),
+    }
+}
+
 // reqwest errors can contain the request URL; never propagate them or raw server bodies.
 fn transport_error(error: reqwest::Error) -> anyhow::Error {
     if error.is_timeout() {
         anyhow::anyhow!("模型请求超时")
     } else {
         anyhow::anyhow!("模型请求网络或传输失败")
+    }
+}
+
+fn catalog_transport_error(error: reqwest::Error) -> anyhow::Error {
+    if error.is_timeout() {
+        anyhow::anyhow!("模型目录请求超时")
+    } else {
+        anyhow::anyhow!("模型目录请求网络或传输失败")
     }
 }
 
@@ -225,6 +368,26 @@ fn parse_response(response: Value) -> Result<ModelTurn> {
 mod tests {
     use super::*;
 
+    fn discovery(
+        on_missing: MissingModelPolicy,
+        on_deprecated: DeprecatedModelPolicy,
+    ) -> ModelDiscoveryConfig {
+        ModelDiscoveryConfig {
+            path: "models".to_owned(),
+            on_missing,
+            on_deprecated,
+            on_error: DiscoveryErrorPolicy::UseConfig,
+        }
+    }
+
+    fn catalog_model(id: &str, deprecated: bool, status: Option<&str>) -> CatalogModel {
+        CatalogModel {
+            id: id.to_owned(),
+            deprecated,
+            status: status.map(str::to_owned),
+        }
+    }
+
     fn message(text: &str) -> Value {
         json!({
             "type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
@@ -353,5 +516,96 @@ mod tests {
         let turn = parse_response(completed(vec![message("Gearbox Demo")])).unwrap();
         assert!(turn.calls.is_empty());
         assert_eq!(turn.text, "Gearbox Demo");
+    }
+
+    #[test]
+    fn catalog_conflicts_follow_the_configured_policies() {
+        let available = [catalog_model("configured", false, None)];
+        assert!(
+            reconcile_model_catalog(
+                "configured",
+                &discovery(MissingModelPolicy::Error, DeprecatedModelPolicy::Error),
+                &available,
+            )
+            .is_ok()
+        );
+
+        let empty = [];
+        assert!(
+            reconcile_model_catalog(
+                "configured",
+                &discovery(MissingModelPolicy::Allow, DeprecatedModelPolicy::Warn),
+                &empty,
+            )
+            .is_ok()
+        );
+        assert!(
+            reconcile_model_catalog(
+                "configured",
+                &discovery(MissingModelPolicy::Warn, DeprecatedModelPolicy::Warn),
+                &empty,
+            )
+            .is_ok()
+        );
+        assert!(
+            reconcile_model_catalog(
+                "configured",
+                &discovery(MissingModelPolicy::Error, DeprecatedModelPolicy::Warn),
+                &empty,
+            )
+            .is_err()
+        );
+
+        for deprecated in [
+            catalog_model("configured", true, None),
+            catalog_model("configured", false, Some("deprecated")),
+        ] {
+            assert!(
+                reconcile_model_catalog(
+                    "configured",
+                    &discovery(MissingModelPolicy::Warn, DeprecatedModelPolicy::Ignore),
+                    std::slice::from_ref(&deprecated),
+                )
+                .is_ok()
+            );
+            assert!(
+                reconcile_model_catalog(
+                    "configured",
+                    &discovery(MissingModelPolicy::Warn, DeprecatedModelPolicy::Warn),
+                    std::slice::from_ref(&deprecated),
+                )
+                .is_ok()
+            );
+            assert!(
+                reconcile_model_catalog(
+                    "configured",
+                    &discovery(MissingModelPolicy::Warn, DeprecatedModelPolicy::Error),
+                    std::slice::from_ref(&deprecated),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn parses_openai_compatible_catalog_metadata() {
+        let catalog: ModelList = serde_json::from_value(json!({
+            "object": "list",
+            "data": [
+                {"id": "active", "object": "model", "owned_by": "provider"},
+                {"id": "old", "deprecated": true},
+                {"id": "legacy", "status": "deprecated"}
+            ]
+        }))
+        .unwrap();
+        assert!(catalog.models_have_valid_ids());
+        assert_eq!(catalog.data.len(), 3);
+        assert!(!catalog.data[0].deprecated);
+        assert!(catalog.data[1].deprecated);
+        assert_eq!(catalog.data[2].status.as_deref(), Some("deprecated"));
+
+        let invalid: ModelList = serde_json::from_value(json!({"data": [{"id": " "}]})).unwrap();
+        assert!(!invalid.models_have_valid_ids());
+        assert!(serde_json::from_value::<ModelList>(json!({"data": [{"id": 1}]})).is_err());
     }
 }

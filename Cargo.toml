@@ -7,7 +7,6 @@ description = "A minimal, serial Agent Loop using the Responses API"
 
 [dependencies]
 anyhow = "1"
-argh = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 same-file = "1"
 serde = { version = "1", features = ["derive"] }

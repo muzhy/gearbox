@@ -61,10 +61,7 @@ impl Stub {
     fn new(replies: Vec<Reply>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        let endpoint = format!(
-            "http://{}/custom/responses?configured=1",
-            listener.local_addr().unwrap()
-        );
+        let endpoint = format!("http://{}/custom", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_requests = Arc::clone(&requests);
@@ -208,11 +205,15 @@ impl Fixture {
         fs::write(
             dir.path().join("data/config.toml"),
             format!(
-                r#"[model]
-endpoint = "{}"
+                r#"[providers.test]
+base_url = "{}"
+protocol = "openai-responses"
 api_key = "{KEY}"
-name = "configured-test-model"
-reasoning_effort = "high"
+
+[[models]]
+provider = "test"
+id = "configured-test-model"
+reasoning = true
 
 [limits]
 max_model_requests = {max_requests}
@@ -239,8 +240,8 @@ max_file_bytes = 4096
         command
             .current_dir(self.dir.path())
             .args([
-                "data",
-                "读取 index.txt，找到资料，再告诉我项目名称和当前阶段。",
+                "--workspace=data",
+                "--task=读取 index.txt，找到资料，再告诉我项目名称和当前阶段。",
             ])
             // These stale settings must not override workspace/config.toml.
             .env("GEARBOX_MODEL_URL", "http://invalid.invalid/unused")
@@ -323,10 +324,10 @@ fn reads_index_then_project_and_replays_original_history() {
     let requests = stub.requests();
     assert_eq!(requests.len(), 3);
     for request in &requests {
-        assert_eq!(request.path, "/custom/responses?configured=1");
+        assert_eq!(request.path, "/custom/responses");
         assert_eq!(request.authorization, format!("Bearer {KEY}"));
         assert_eq!(request.body["model"], "configured-test-model");
-        assert_eq!(request.body["reasoning"]["effort"], "high");
+        assert_eq!(request.body["reasoning"], json!({}));
         assert_eq!(request.body["max_output_tokens"], 321);
         assert_eq!(request.body["stream"], false);
         assert_eq!(request.body["store"], false);
